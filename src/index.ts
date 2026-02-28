@@ -23,6 +23,10 @@ import { FeedbackTuner } from "./layers/feedback-tuner.js";
 import { PredictivePreloader } from "./layers/predictive-preloader.js";
 import { CrossAgentSharing } from "./layers/cross-agent.js";
 import { ThemeCache } from "./layers/theme-cache.js";
+import { IndexRank } from "./layers/index-rank.js";
+import { OutputCompactor } from "./layers/output-compactor.js";
+import { BudgetManager } from "./layers/budget-manager.js";
+import { UncertaintyDetector, ActiveRetrieval } from "./layers/active-retrieval.js";
 import { embedSingle } from "./utils/embedding.js";
 
 // --- State ---
@@ -42,7 +46,12 @@ const preloader = new PredictivePreloader();
 const crossAgent = new CrossAgentSharing();
 const themeCache = new ThemeCache();
 const decayManager = new DecayManager();
-// traces replaced by observability module
+const indexRank = new IndexRank(4);
+const outputCompactor = new OutputCompactor();
+const budgetManager = new BudgetManager(4000);
+// v1.2 modules: U-Mem active retrieval
+const uncertaintyDetector = new UncertaintyDetector();
+const activeRetrieval = new ActiveRetrieval();
 
 export default function contextEngine(api: OpenClawPluginApi) {
   const logger = api.logger;
@@ -156,37 +165,60 @@ export default function contextEngine(api: OpenClawPluginApi) {
         return undefined;
       }
 
-      // Build systemPrompt injection
-      const parts: string[] = [];
+      // v1.2: Budget-managed context assembly
+      const budgetItems: { tier: string; label: string; content: string }[] = [];
 
-      // 1. Theme overview (~50 tokens)
+      // P2: Memory — themes + semantics + episodes
       if (result.themes.length > 0) {
-        parts.push("## Active Context");
-        parts.push(`Current topics: ${result.themes.map(t => t.name).join(", ")}`);
+        budgetItems.push({
+          tier: "memory",
+          label: "themes",
+          content: `## Active Context\nCurrent topics: ${result.themes.map(t => t.name).join(", ")}`,
+        });
       }
 
-      // 2. User profile (~100 tokens)
       const profile = await storage.getLatestProfile("default");
       if (profile?.global_profile) {
-        parts.push("## User Profile");
-        parts.push(profile.global_profile);
+        budgetItems.push({
+          tier: "memory",
+          label: "user-profile",
+          content: `## User Profile\n${profile.global_profile}`,
+        });
       }
 
-      // 3. Semantic facts (~150 tokens)
       if (result.semantics.length > 0) {
-        parts.push("## Relevant Facts");
-        for (const s of result.semantics.slice(0, 8)) {
-          parts.push(`- ${s.content}`);
-        }
+        const facts = result.semantics.slice(0, 8).map(s => `- ${s.content}`).join("\n");
+        budgetItems.push({
+          tier: "memory",
+          label: "semantics",
+          content: `## Relevant Facts\n${facts}`,
+        });
       }
 
-      // 4. Episode details (if expanded, ~200 tokens)
       if (result.episodes.length > 0) {
-        parts.push("## Details");
-        for (const e of result.episodes.slice(0, 3)) {
-          parts.push(`- ${e.summary}`);
-        }
+        const details = result.episodes.slice(0, 3).map(e => `- ${e.summary}`).join("\n");
+        budgetItems.push({
+          tier: "memory",
+          label: "episodes",
+          content: `## Details\n${details}`,
+        });
       }
+
+      // v1.2: IndexRank — workspace file summaries for non-injected files
+      // (actual workspace file injection is handled by OpenClaw runtime,
+      //  we provide ranking hints via extras tier)
+      const topics = indexRank.classifyTopic(prompt);
+      budgetItems.push({
+        tier: "extras",
+        label: "topic-hint",
+        content: `[context-engine] Topic: ${topics.join(", ")}`,
+      });
+
+      // Allocate budget
+      const report = budgetManager.allocate(budgetItems);
+
+      // Assemble final injection
+      const assembledParts = report.allocations.map(a => a.content);
 
       // v1.1: Observability trace
       const trace = observability.buildTrace(prompt, result);
@@ -195,14 +227,41 @@ export default function contextEngine(api: OpenClawPluginApi) {
       logger.info(
         `[context-engine] Injected: ${result.themes.length} themes, ` +
         `${result.semantics.length} semantics, ${result.episodes.length} episodes, ` +
-        `~${result.total_tokens} tokens, decision=${result.stage2_decision}`
+        `~${report.totalUsed}/${report.totalBudget} tokens (saved ${report.savings}), ` +
+        `decision=${result.stage2_decision}`
       );
 
       return {
-        systemPrompt: "\n" + parts.join("\n"),
+        systemPrompt: "\n" + assembledParts.join("\n"),
       };
     } catch (err) {
       logger.warn(`[context-engine] Retrieval error: ${err}`);
+      return undefined;
+    }
+  });
+
+  // ================================================================
+  // Hook: tool_result_persist — Compact tool outputs to save tokens
+  // ================================================================
+  api.on("tool_result_persist", async (event: any, ctx: any) => {
+    if (!config.enabled) return undefined;
+
+    const { toolName, result } = event;
+    if (!result || typeof result !== "string") return undefined;
+
+    const llmCall = createLlmCall(ctx);
+    try {
+      const compacted = await outputCompactor.compact(toolName, result, llmCall);
+
+      if (compacted.strategy === "passthrough") return undefined;
+
+      logger.info(
+        `[context-engine] Compacted ${toolName}: ${compacted.originalTokens}→${compacted.compactedTokens} tokens (${compacted.strategy})`
+      );
+
+      return { result: compacted.content };
+    } catch (err) {
+      logger.warn(`[context-engine] Compact error: ${err}`);
       return undefined;
     }
   });
@@ -217,7 +276,53 @@ export default function contextEngine(api: OpenClawPluginApi) {
       const messages: Message[] = ((event as Record<string, unknown>).messages as Message[]) || [];
       if (messages.length === 0) return;
 
-      // Add messages to episode builder (with topic switch detection)
+      // --- U-Mem: Uncertainty detection + active retrieval ---
+      const lastAssistant = [...messages].reverse().find(m => m.role === "assistant");
+      const lastUser = [...messages].reverse().find(m => m.role === "user");
+      if (lastAssistant && lastUser) {
+        const signal = uncertaintyDetector.detect(lastAssistant.content, lastUser.content);
+        const isRepeat = uncertaintyDetector.isRepeatedQuestion(
+          lastUser.content, activeRetrieval.getRecentQueries()
+        );
+
+        if (signal.level !== "none" || isRepeat) {
+          if (isRepeat) signal.level = "medium"; // escalate repeated questions
+
+          const apiAny = api as unknown as Record<string, unknown>;
+          const result = await activeRetrieval.retrieve(
+            lastUser.content,
+            lastAssistant.content,
+            signal,
+            {
+              memoryRecall: typeof apiAny.memory_recall === "function"
+                ? async (q: string) => {
+                    const r = await (apiAny.memory_recall as (q: string) => Promise<string[]>)(q);
+                    return r || [];
+                  }
+                : undefined,
+            }
+          );
+
+          if (result.findings.length > 0) {
+            logger.info(
+              `[context-engine] U-Mem: ${signal.level} uncertainty, ` +
+              `source=${result.source}, findings=${result.findings.length}, verified=${result.verified}`
+            );
+          }
+
+          // Store new verified facts
+          if (result.newFacts.length > 0 && typeof apiAny.memory_store === "function") {
+            for (const fact of result.newFacts.slice(0, 3)) {
+              await (apiAny.memory_store as (t: string, c: string, i: number) => Promise<void>)(
+                fact, "fact", 0.75
+              );
+            }
+            logger.info(`[context-engine] U-Mem: stored ${result.newFacts.length} new facts`);
+          }
+        }
+      }
+
+      // --- Episode building ---
       const llmCall = createLlmCall(ctx);
       let prevMsg: Message | null = null;
       for (const msg of messages) {
@@ -397,5 +502,5 @@ export default function contextEngine(api: OpenClawPluginApi) {
     });
   }
 
-  logger.info("[context-engine] v1.1.0 registered: before_prompt_build + agent_end + cron_weekly hooks");
+  logger.info("[context-engine] v1.2.0 registered: before_prompt_build + tool_result_persist + agent_end (U-Mem) + cron_weekly hooks");
 }
