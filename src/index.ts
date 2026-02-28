@@ -29,6 +29,7 @@ import { BudgetManager } from "./layers/budget-manager.js";
 import { UncertaintyDetector, ActiveRetrieval, MemoryToolkit } from "./layers/active-retrieval.js";
 import { TemporalIntentParser, SemanticTimeExtractor, DurativeMemoryBuilder, TemporalRetriever } from "./layers/temporal-memory.js";
 import type { TemporalEvent } from "./layers/temporal-memory.js";
+import { FlowEngine } from "./layers/flow-engine.js";
 import { embedSingle } from "./utils/embedding.js";
 
 // --- State ---
@@ -60,10 +61,12 @@ const temporalRetriever = new TemporalRetriever();
 const semanticTimeExtractor = new SemanticTimeExtractor();
 const durativeMemoryBuilder = new DurativeMemoryBuilder();
 let temporalEvents: TemporalEvent[] = []; // in-memory cache of recent temporal events
+// v1.4 modules: FlowEngine — zero-cost multi-agent DAG orchestration
+const flowEngine = new FlowEngine();
 
 export default function contextEngine(api: OpenClawPluginApi) {
   const logger = api.logger;
-  logger.info("[context-engine] v1.0.0 initializing — xMemory + MemWeaver fusion");
+  logger.info("[context-engine] v1.4.0 initializing — xMemory + MemWeaver + FlowEngine fusion");
 
   // Resolve config
   const pluginConfig = (api as unknown as Record<string, unknown>).config as Partial<ContextEngineConfig> || {};
@@ -556,5 +559,9 @@ export default function contextEngine(api: OpenClawPluginApi) {
     });
   }
 
-  logger.info("[context-engine] v1.3.0 registered: before_prompt_build (TSM temporal filter) + tool_result_persist + agent_end (U-Mem + TSM) + cron_weekly hooks");
+  logger.info("[context-engine] v1.4.0 registered: before_prompt_build (TSM temporal filter) + tool_result_persist + agent_end (U-Mem + AgeMem + TSM) + cron_weekly + FlowEngine hooks");
 }
+
+// Export FlowEngine classes + singleton for external use
+export { FlowEngine, ZeroCostRouter, FlowResolver, WaveExecutor, LearningLoop } from "./layers/flow-engine.js";
+export { flowEngine };
