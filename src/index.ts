@@ -26,7 +26,9 @@ import { ThemeCache } from "./layers/theme-cache.js";
 import { IndexRank } from "./layers/index-rank.js";
 import { OutputCompactor } from "./layers/output-compactor.js";
 import { BudgetManager } from "./layers/budget-manager.js";
-import { UncertaintyDetector, ActiveRetrieval } from "./layers/active-retrieval.js";
+import { UncertaintyDetector, ActiveRetrieval, MemoryToolkit } from "./layers/active-retrieval.js";
+import { TemporalIntentParser, SemanticTimeExtractor, DurativeMemoryBuilder, TemporalRetriever } from "./layers/temporal-memory.js";
+import type { TemporalEvent } from "./layers/temporal-memory.js";
 import { embedSingle } from "./utils/embedding.js";
 
 // --- State ---
@@ -52,6 +54,12 @@ const budgetManager = new BudgetManager(4000);
 // v1.2 modules: U-Mem active retrieval
 const uncertaintyDetector = new UncertaintyDetector();
 const activeRetrieval = new ActiveRetrieval();
+const memoryToolkit = new MemoryToolkit();
+// v1.3 modules: TSM temporal semantic memory
+const temporalRetriever = new TemporalRetriever();
+const semanticTimeExtractor = new SemanticTimeExtractor();
+const durativeMemoryBuilder = new DurativeMemoryBuilder();
+let temporalEvents: TemporalEvent[] = []; // in-memory cache of recent temporal events
 
 export default function contextEngine(api: OpenClawPluginApi) {
   const logger = api.logger;
@@ -196,7 +204,12 @@ export default function contextEngine(api: OpenClawPluginApi) {
       }
 
       if (result.episodes.length > 0) {
-        const details = result.episodes.slice(0, 3).map(e => `- ${e.summary}`).join("\n");
+        // v1.3: TSM temporal filtering — rerank episodes by temporal intent
+        const filteredEpisodes = temporalRetriever.filterByTemporalIntent(
+          prompt, result.episodes, temporalEvents
+        );
+        const episodesToShow = filteredEpisodes.length > 0 ? filteredEpisodes : result.episodes;
+        const details = episodesToShow.slice(0, 3).map(e => `- ${e.summary}`).join("\n");
         budgetItems.push({
           tier: "memory",
           label: "episodes",
@@ -280,6 +293,7 @@ export default function contextEngine(api: OpenClawPluginApi) {
       const lastAssistant = [...messages].reverse().find(m => m.role === "assistant");
       const lastUser = [...messages].reverse().find(m => m.role === "user");
       if (lastAssistant && lastUser) {
+        const apiAny = api as unknown as Record<string, unknown>;
         const signal = uncertaintyDetector.detect(lastAssistant.content, lastUser.content);
         const isRepeat = uncertaintyDetector.isRepeatedQuestion(
           lastUser.content, activeRetrieval.getRecentQueries()
@@ -288,7 +302,6 @@ export default function contextEngine(api: OpenClawPluginApi) {
         if (signal.level !== "none" || isRepeat) {
           if (isRepeat) signal.level = "medium"; // escalate repeated questions
 
-          const apiAny = api as unknown as Record<string, unknown>;
           const result = await activeRetrieval.retrieve(
             lastUser.content,
             lastAssistant.content,
@@ -318,6 +331,25 @@ export default function contextEngine(api: OpenClawPluginApi) {
               );
             }
             logger.info(`[context-engine] U-Mem: stored ${result.newFacts.length} new facts`);
+          }
+        }
+
+        // --- AgeMem: Autonomous memory decisions ---
+        const existingMems = typeof apiAny.memory_recall === "function"
+          ? await (apiAny.memory_recall as (q: string) => Promise<string[]>)(lastUser.content).catch(() => [] as string[])
+          : [];
+        const decisions = memoryToolkit.decide(lastUser.content, lastAssistant.content, existingMems);
+        if (decisions.length > 0) {
+          const executed = await memoryToolkit.execute(decisions, {
+            memoryStore: typeof apiAny.memory_store === "function"
+              ? async (t, c, i) => await (apiAny.memory_store as (t: string, c: string, i: number) => Promise<void>)(t, c, i)
+              : undefined,
+            memoryForget: typeof apiAny.memory_forget === "function"
+              ? async (q) => await (apiAny.memory_forget as (q: string) => Promise<void>)(q)
+              : undefined,
+          });
+          if (executed > 0) {
+            logger.info(`[context-engine] AgeMem: ${executed}/${decisions.length} memory ops executed`);
           }
         }
       }
@@ -350,6 +382,28 @@ export default function contextEngine(api: OpenClawPluginApi) {
       await storage.addEpisode(episode as Episode & { embedding: number[] });
       logger.info(`[context-engine] Episode created: ${episode.episode_id} (${episode.message_count} msgs)`);
 
+      // v1.3: TSM — extract semantic time from episode
+      const { semantic_time, duration_ms } = semanticTimeExtractor.extractHeuristic(
+        episode.summary, episode.created_at
+      );
+      const tEvent: TemporalEvent = {
+        event_id: episode.episode_id,
+        content: episode.summary,
+        semantic_time,
+        dialogue_time: episode.created_at,
+        duration_ms,
+        source_episode_id: episode.episode_id,
+        embedding: (episode as Episode & { embedding: number[] }).embedding,
+      };
+      temporalEvents.push(tEvent);
+      // Keep only last 200 events in memory
+      if (temporalEvents.length > 200) temporalEvents = temporalEvents.slice(-200);
+
+      // Build durative memories from recent events
+      const duratives = durativeMemoryBuilder.consolidate(temporalEvents.slice(-50));
+      if (duratives.length > 0) {
+        logger.info(`[context-engine] TSM: ${duratives.length} durative memories, semantic_time=${new Date(semantic_time).toISOString().split("T")[0]}`);
+      }
       // Extract semantics from episode
       const existingSemantics = await storage.searchSemantics(
         (episode as Episode & { embedding: number[] }).embedding, 20
@@ -502,5 +556,5 @@ export default function contextEngine(api: OpenClawPluginApi) {
     });
   }
 
-  logger.info("[context-engine] v1.2.0 registered: before_prompt_build + tool_result_persist + agent_end (U-Mem) + cron_weekly hooks");
+  logger.info("[context-engine] v1.3.0 registered: before_prompt_build (TSM temporal filter) + tool_result_persist + agent_end (U-Mem + TSM) + cron_weekly hooks");
 }

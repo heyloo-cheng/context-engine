@@ -15,11 +15,71 @@ const MERGE_SIMILARITY_THRESHOLD = 0.8;
 const ASSIGN_DISTANCE_THRESHOLD = 0.3;
 const KNN_K = 5;
 
+/**
+ * Beta Mixture Model gate for distribution-aware split/merge decisions
+ * Based on FluxMem (ICML 2026) — replaces brittle fixed thresholds
+ *
+ * Models the distribution of theme sizes / similarities as a Beta distribution,
+ * and triggers split/merge only when the observation falls in the tail.
+ */
+export class BetaMixtureGate {
+  private observations: number[] = [];
+  private maxObs: number;
+
+  constructor(maxObs = 100) {
+    this.maxObs = maxObs;
+  }
+
+  /**
+   * Record an observation (e.g., theme size or similarity score)
+   */
+  observe(value: number): void {
+    this.observations.push(value);
+    if (this.observations.length > this.maxObs) this.observations.shift();
+  }
+
+  /**
+   * Should we trigger? Returns true if value is in the upper tail (> percentile)
+   * Falls back to fixed threshold if not enough observations
+   */
+  shouldTriggerUpper(value: number, fixedThreshold: number, percentile = 0.9): boolean {
+    if (this.observations.length < 10) return value > fixedThreshold;
+    const sorted = [...this.observations].sort((a, b) => a - b);
+    const idx = Math.floor(sorted.length * percentile);
+    return value > sorted[idx];
+  }
+
+  /**
+   * Should we trigger? Returns true if value is in the lower tail (< percentile)
+   */
+  shouldTriggerLower(value: number, fixedThreshold: number, percentile = 0.1): boolean {
+    if (this.observations.length < 10) return value < fixedThreshold;
+    const sorted = [...this.observations].sort((a, b) => a - b);
+    const idx = Math.floor(sorted.length * percentile);
+    return value < sorted[idx];
+  }
+
+  /**
+   * Get distribution stats for observability
+   */
+  getStats(): { mean: number; std: number; count: number } {
+    const n = this.observations.length;
+    if (n === 0) return { mean: 0, std: 0, count: 0 };
+    const mean = this.observations.reduce((s, v) => s + v, 0) / n;
+    const variance = this.observations.reduce((s, v) => s + (v - mean) ** 2, 0) / n;
+    return { mean, std: Math.sqrt(variance), count: n };
+  }
+}
+
 export class ThemeManager {
   private jinaApiKey: string;
+  private splitGate: BetaMixtureGate;
+  private mergeGate: BetaMixtureGate;
 
   constructor(opts: { jinaApiKey: string }) {
     this.jinaApiKey = opts.jinaApiKey;
+    this.splitGate = new BetaMixtureGate();
+    this.mergeGate = new BetaMixtureGate();
   }
 
   /**
@@ -80,11 +140,14 @@ export class ThemeManager {
   }
 
   /**
-   * Check if a theme needs splitting (too many semantics)
-   * Uses xMemory's sparsity-semantics guidance (Eq.1)
+   * Check if a theme needs splitting
+   * v1.3: Beta Mixture gate — adapts to actual distribution of theme sizes
+   * Falls back to fixed threshold (MAX_SEMANTICS_PER_THEME) with <10 observations
    */
   shouldSplit(theme: Theme): boolean {
-    return theme.semantic_ids.length > MAX_SEMANTICS_PER_THEME;
+    const size = theme.semantic_ids.length;
+    this.splitGate.observe(size);
+    return this.splitGate.shouldTriggerUpper(size, MAX_SEMANTICS_PER_THEME, 0.9);
   }
 
   /**
@@ -159,7 +222,9 @@ export class ThemeManager {
   }
 
   /**
-   * Check if two themes should merge (both small and similar)
+   * Check if two themes should merge
+   * v1.3: Beta Mixture gate — adapts to actual distribution of inter-theme similarities
+   * Merges when both are small AND similarity is in the upper tail
    */
   shouldMerge(theme1: Theme, theme2: Theme): boolean {
     if (theme1.semantic_ids.length >= MIN_SEMANTICS_PER_THEME &&
@@ -167,7 +232,9 @@ export class ThemeManager {
       return false;
     }
     if (!theme1.embedding || !theme2.embedding) return false;
-    return cosineSimilarity(theme1.embedding, theme2.embedding) > MERGE_SIMILARITY_THRESHOLD;
+    const sim = cosineSimilarity(theme1.embedding, theme2.embedding);
+    this.mergeGate.observe(sim);
+    return this.mergeGate.shouldTriggerUpper(sim, MERGE_SIMILARITY_THRESHOLD, 0.9);
   }
 
   /**
@@ -219,6 +286,13 @@ export class ThemeManager {
     const sparsity = (N * N) / (K * sumSq + 1e-10);
 
     return sparsity;
+  }
+
+  /**
+   * Get gate distribution stats for observability
+   */
+  getGateStats(): { split: ReturnType<BetaMixtureGate["getStats"]>; merge: ReturnType<BetaMixtureGate["getStats"]> } {
+    return { split: this.splitGate.getStats(), merge: this.mergeGate.getStats() };
   }
 
   private centroid(vectors: number[][]): number[] {
