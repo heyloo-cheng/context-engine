@@ -1,0 +1,21 @@
+{
+  "name": "context-engine-v1",
+  "version": "1.0.0",
+  "description": "Context Engine v1.0 — xMemory + MemWeaver fusion for OpenClaw. 4-layer hierarchical memory with top-down retrieval.",
+  "type": "module",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "test": "node --test tests/"
+  },
+  "openclaw": {
+    "type": "extension",
+    "extensions": ["./dist/index.js"]
+  },
+  "devDependencies": {
+    "typescript": "^5.4.0",
+    "@types/node": "^22.0.0"
+  },
+  "license": "MIT"
+}

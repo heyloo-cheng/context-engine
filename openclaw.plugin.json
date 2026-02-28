@@ -1,0 +1,16 @@
+{
+  "id": "context-engine",
+  "name": "Context Engine v1.0",
+  "description": "xMemory + MemWeaver fusion — 4-layer hierarchical memory with top-down retrieval and user profiling",
+  "version": "1.0.0",
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "enabled": { "type": "boolean", "description": "Enable/disable context engine" },
+      "maxThemes": { "type": "number", "description": "Max themes to keep" },
+      "episodeBatchSize": { "type": "number", "description": "Messages per episode (default 5)" },
+      "tokenBudget": { "type": "number", "description": "Max tokens to inject (default 500)" }
+    }
+  }
+}
